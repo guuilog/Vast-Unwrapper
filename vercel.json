@@ -1,9 +1,1 @@
-{
-  "functions": {
-    "api/**/*.mjs": {
-      "runtime": "nodejs20.x",
-      "memory": 1024
-      // You can also set "maxDuration": <seconds> if your plan allows.
-    }
-  }
-}
+
