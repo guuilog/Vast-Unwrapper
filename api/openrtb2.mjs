@@ -137,23 +137,61 @@ function withTimeout(ms = 8000) {
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
-// Limit response size
-function makeSizeLimitedReader(stream, maxBytes = 1_500_000) {
-  return new Promise((resolve, reject) => {
-    let total = 0;
-    const chunks = [];
-    stream.on("data", (c) => {
-      const b = Buffer.from(c);
-      total += b.length;
-      if (total > maxBytes) {
-        stream.destroy();
-        return reject(Object.assign(new Error("Upstream response too large"), { statusCode: 502 }));
-      }
-      chunks.push(b);
+// Read response body with size limit; supports Web streams and Node streams
+function isNodeReadableStream(obj) {
+  return obj && typeof obj.on === "function" && typeof obj.pipe === "function";
+}
+
+async function readBodyLimited(resp, maxBytes = 1_500_000) {
+  // Content-Length pre-check (if present)
+  const cl = resp.headers.get("content-length");
+  if (cl && Number(cl) > maxBytes) {
+    const err = new Error(`Upstream response too large (Content-Length ${cl} > ${maxBytes})`);
+    err.statusCode = 502;
+    throw err;
+  }
+
+  const body = resp.body;
+  if (!body) return Buffer.alloc(0);
+
+  // Node stream path (rare with WHATWG fetch, but handle it)
+  if (isNodeReadableStream(body)) {
+    return new Promise((resolve, reject) => {
+      let total = 0;
+      const chunks = [];
+      body.on("data", (c) => {
+        const b = Buffer.from(c);
+        total += b.length;
+        if (total > maxBytes) {
+          body.destroy();
+          return reject(Object.assign(new Error("Upstream response too large"), { statusCode: 502 }));
+        }
+        chunks.push(b);
+      });
+      body.on("end", () => resolve(Buffer.concat(chunks)));
+      body.on("error", (e) => reject(e));
     });
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", (e) => reject(e));
-  });
+  }
+
+  // Web ReadableStream path (Vercel/Node fetch)
+  const reader = body.getReader();
+  let total = 0;
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch {}
+        const err = new Error("Upstream response too large");
+        err.statusCode = 502;
+        throw err;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  }
+  return Buffer.concat(chunks);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +311,7 @@ export default async function handler(req, res) {
       return sendError(res, 502, `Upstream returned unexpected content-type: ${ct}`);
     }
 
-    const buf = await makeSizeLimitedReader(upstreamResp.body, maxBytes);
+    const buf = await readBodyLimited(upstreamResp, maxBytes);
     res.status(upstreamResp.status);
     res.setHeader("content-type", ct);
     res.send(buf);
