@@ -81,7 +81,7 @@ function getBidEndpoint(req, env = process.env) {
 
   if (!candidate) {
     const tips = [
-      "Provide header 'x-bid-endpoint: https://host/path?callerId=241'",
+      "Provide header 'x-bid-endpoint: https://host/api/bid?callerId='",
       "Or set env EQUATIV_BID_URL",
       "Optional: 'x-bid-endpoint-b64' (base64) or query '?bidEndpoint=' (debug)"
     ].join(" | ");
