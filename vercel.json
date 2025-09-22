@@ -1,4 +1,0 @@
-{
-  "buildCommand": "echo \"no build step\"",
-  "outputDirectory": "public"
-}
