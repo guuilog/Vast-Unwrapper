@@ -44,8 +44,6 @@ function getBidEndpoint(req, env = process.env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Body + CORS + timeout helpers
-// ─────────────────────────────────────────────────────────────────────────────
 async function readRequestBody(req) {
   if (req.body && typeof req.body === "object") return req.body;
   const chunks = [];
@@ -91,7 +89,9 @@ function deriveEquativRvUrlFromNurl(nurl) {
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  setCors(res, req);
+  try {
+    setCors(res, req);
+  } catch {}
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
@@ -131,7 +131,10 @@ export default async function handler(req, res) {
     // Parse JSON
     let bidResp;
     try { bidResp = JSON.parse(bidRespText); }
-    catch { res.status(upstreamResp.status).setHeader("content-type", ct); return res.send(bidRespText); }
+    catch {
+      res.status(upstreamResp.status).setHeader("content-type", ct);
+      return res.send(bidRespText);
+    }
 
     // 2) Traverse bids and unwrap/merge as needed
     let anyReplaced = false;
@@ -143,22 +146,29 @@ export default async function handler(req, res) {
         for (const b of (sb?.bid || [])) {
           if (typeof b.adm !== "string") continue;
 
+          // Case A: normal unwrap (Wrapper → Inline)
           if (b.adm.includes("<Wrapper")) {
-            // Normal unwrap flow (Wrapper → Inline + merges)
-            const { adm, replaced, depth, cached } = await unwrapAdmIfWrapper(b.adm);
-            if (replaced) {
-              b.adm = adm;
-              anyReplaced = true;
-              if (cached === "hit") anyCacheHit = true;
-              b.ext = { ...(b.ext || {}), unwrap: { depth, cached } };
+            try {
+              const { adm, replaced, depth, cached } = await unwrapAdmIfWrapper(b.adm);
+              if (replaced) {
+                b.adm = adm;
+                anyReplaced = true;
+                if (cached === "hit") anyCacheHit = true;
+                b.ext = { ...(b.ext || {}), unwrap: { depth, cached } };
+              }
+            } catch (e) {
+              if (DEBUG) console.warn("[unwrap] failed:", e?.message || e);
+              b.ext = { ...(b.ext || {}), unwrap: { depth: -1, cached: "n/a", error: "unwrap-failed" } };
             }
-          } else if (b.nurl && b.adm.includes("<InLine")) {
-            // New fallback: Inline-only bid → pull SSP Impressions from wrapper via RV URL
-            const rvUrl = deriveEquativRvUrlFromNurl(b.nurl);
+          }
+          // Case B: Inline-only bid → derive wrapper URL from nurl to merge SSP Impressions
+          else if (b.nurl && b.adm.includes("<InLine")) {
+            let rvUrl = null;
+            try { rvUrl = deriveEquativRvUrlFromNurl(b.nurl); } catch {}
             if (rvUrl) {
               try {
                 const mergedXml = await mergeWrapperImpressionsIntoInlineXml(b.adm, rvUrl);
-                if (mergedXml && mergedXml !== b.adm) {
+                if (mergedXml && typeof mergedXml === "string") {
                   b.adm = mergedXml;
                   anyMergedWrapperImps = true;
                 }
@@ -179,4 +189,12 @@ export default async function handler(req, res) {
     res.setHeader("X-Unwrap", anyReplaced || anyMergedWrapperImps ? "inline" : "passthrough");
     res.setHeader("X-Unwrap-Cache", anyCacheHit ? "hit" : "miss");
 
-    return res.status(upstreamResp.status).jso
+    return res.status(upstreamResp.status).json(bidResp);
+  } catch (e) {
+    const aborted = e?.name === "AbortError";
+    const msg = aborted ? `Upstream request timed out after ${timeoutMs}ms` : (e.message || String(e));
+    return res.status(aborted ? 504 : 502).json({ error: { code: String(aborted ? 504 : 502), message: msg } });
+  } finally {
+    cancel();
+  }
+}
