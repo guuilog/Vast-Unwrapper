@@ -1,10 +1,10 @@
 {
   "name": "vast-unwrapper",
   "version": "1.0.0",
-  "type": "module",
   "private": true,
+  "type": "module",
   "scripts": {
-    "build": "echo 'no build step'",
+    "build": "echo \"no build step\"",
     "start": "vercel dev"
   },
   "dependencies": {
