@@ -152,7 +152,6 @@ export default async function handler(req, res) {
                 b.ext = { ...(b.ext || {}), unwrap: { depth, cached } };
                 lastDebug = { mode: "unwrap", depth, cached };
               } else {
-                // even though <Wrapper> existed, nothing changed
                 lastDebug = { mode: "unwrap", depth: 0, cached: "miss" };
               }
             } catch (e) {
@@ -161,31 +160,49 @@ export default async function handler(req, res) {
             }
           }
 
-          // ── STEP B: ALWAYS try RV merge if final adm is Inline and nurl is present
-          //            (covers Inline-only bids AND cases where unwrap depth=0)
+          // ── STEP B: ALWAYS try RV merge if final adm is Inline and nurl present
           if (b.nurl && typeof b.adm === "string" && b.adm.includes("<InLine")) {
             const rvUrl = deriveEquativRvUrlFromNurl(b.nurl);
             if (rvUrl) {
               try {
                 const beforeXml = b.adm;
-                const mergedXml = await mergeWrapperImpressionsIntoInlineXml(beforeXml, rvUrl, { debug });
-                // If merge produced something different, mark it
-                if (mergedXml && typeof mergedXml === "string" && mergedXml !== beforeXml) {
+                const { xml: mergedXml, stats } = await mergeWrapperImpressionsIntoInlineXml(beforeXml, rvUrl, { debug });
+                const changed = Boolean(mergedXml && typeof mergedXml === "string" && mergedXml !== beforeXml);
+
+                if (changed) {
                   b.adm = mergedXml;
                   anyMergedWrapperImps = true;
-                  // Annotate/augment ext.unwrap (don’t overwrite prior info)
-                  b.ext = {
-                    ...(b.ext || {}),
-                    unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: true, rvUrl }
-                  };
-                  lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: true, afterUnwrap: didUnwrap };
-                } else {
-                  b.ext = {
-                    ...(b.ext || {}),
-                    unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, rvUrl, reason: "no-change" }
-                  };
-                  lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: false, reason: "no-change", afterUnwrap: didUnwrap };
                 }
+
+                // Annotate the bid.ext.unwrap with the outcome + counts
+                b.ext = {
+                  ...(b.ext || {}),
+                  unwrap: {
+                    ...(b.ext?.unwrap || {}),
+                    mergedWrapperImps: changed,
+                    rvUrl,
+                    rvHasWrapper: stats?.rvHasWrapper,
+                    rvHasInline: stats?.rvHasInline,
+                    rvImpCount: stats?.rvImpCount,
+                    targetImpBefore: stats?.targetImpBefore,
+                    targetImpAfter: stats?.targetImpAfter,
+                    reason: changed ? undefined : "no-change"
+                  }
+                };
+
+                // richer response header when debug=1 (lastDebug)
+                lastDebug = {
+                  mode: "merge-wrapper-imps",
+                  rvUrl,
+                  merged: changed,
+                  afterUnwrap: didUnwrap,
+                  rvHasWrapper: stats?.rvHasWrapper,
+                  rvHasInline: stats?.rvHasInline,
+                  rvImpCount: stats?.rvImpCount,
+                  targetImpBefore: stats?.targetImpBefore,
+                  targetImpAfter: stats?.targetImpAfter,
+                  wrapperSnippet: debug ? stats?.wrapperSnippet : undefined
+                };
               } catch (e) {
                 b.ext = {
                   ...(b.ext || {}),
@@ -194,11 +211,7 @@ export default async function handler(req, res) {
                 lastDebug = { mode: "merge-wrapper-imps", rvUrl, error: e?.message || String(e), afterUnwrap: didUnwrap };
               }
             } else {
-              // couldn’t derive RV URL from nurl
-              b.ext = {
-                ...(b.ext || {}),
-                unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, reason: "rv-url-not-derived" }
-              };
+              b.ext = { ...(b.ext || {}), unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, reason: "rv-url-not-derived" } };
               lastDebug = { mode: "merge-wrapper-imps", rvUrl: null, reason: "rv-url-not-derived", afterUnwrap: didUnwrap };
             }
           }
