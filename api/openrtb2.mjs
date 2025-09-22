@@ -33,11 +33,7 @@ function getBidEndpoint(req, env = process.env) {
     (req.query?.bidEndpoint ? String(req.query.bidEndpoint) : null) ||
     (env?.EQUATIV_BID_URL || null);
 
-  if (!candidate) {
-    const tips = "Provide header x-bid-endpoint or set EQUATIV_BID_URL";
-    const err = new Error(`No bid endpoint provided. ${tips}`);
-    err.statusCode = 400; throw err;
-  }
+  if (!candidate) { const e = new Error("No bid endpoint provided"); e.statusCode = 400; throw e; }
   if (!isHttpsUrl(candidate)) { const e = new Error("Bid endpoint must be https"); e.statusCode = 400; throw e; }
   if (!isAllowedHost(candidate, allowlist)) { const e = new Error("Endpoint host not allowed"); e.statusCode = 403; throw e; }
   return candidate.trim();
@@ -68,14 +64,18 @@ function withTimeout(ms = 8000) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Equativ-specific: derive RV (wrapper) URL from nurl for Inline-only bids
-//  - ssb-use1.smartadserver.com → use1.smartadserver.com
+// Equativ RV derivation (more tolerant)
+//  - from nurl host:
+//      ssb-use1.smartadserver.com → use1.smartadserver.com
+//      ssb-euw1.smartadserver.com → euw1.smartadserver.com
 //  - vastid = bidid, networkId = bidnwid
 // ─────────────────────────────────────────────────────────────────────────────
 function deriveEquativRvUrlFromNurl(nurl) {
   try {
     const u = new URL(nurl);
-    const host = u.host.replace(/^ssb-/, "");
+    let host = u.host;
+    if (host.startsWith("ssb-")) host = host.slice(4);
+    // sometimes host already without ssb-
     const vastid = u.searchParams.get("bidid");
     const networkId = u.searchParams.get("bidnwid");
     if (!vastid || !networkId) return null;
@@ -89,11 +89,11 @@ function deriveEquativRvUrlFromNurl(nurl) {
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  try {
-    setCors(res, req);
-  } catch {}
+  try { setCors(res, req); } catch {}
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+  const debug = DEBUG || String(req.query?.debug || "").toLowerCase() === "1";
 
   let upstreamUrl;
   try { upstreamUrl = getBidEndpoint(req); }
@@ -107,14 +107,14 @@ export default async function handler(req, res) {
   const { signal, cancel } = withTimeout(timeoutMs);
 
   try {
-    // 1) Forward OpenRTB request upstream
+    // 1) Upstream OpenRTB
     const upstreamResp = await fetch(upstreamUrl, {
       method: "POST",
       signal,
       headers: {
         accept: "application/json, text/plain, */*",
         "content-type": "application/json",
-        "user-agent": req.headers["user-agent"] || "VAST-Unwrapper/1.0",
+        "user-agent": req.headers["user-agent"] || "VAST-Unwrapper/1.1",
       },
       body: JSON.stringify(bodyJson),
     });
@@ -122,31 +122,27 @@ export default async function handler(req, res) {
     const ct = upstreamResp.headers.get("content-type") || "application/json; charset=utf-8";
     let bidRespText = await upstreamResp.text();
 
-    // If not JSON, just pass through
     if (!ct.includes("json")) {
       res.status(upstreamResp.status).setHeader("content-type", ct);
       return res.send(bidRespText);
     }
 
-    // Parse JSON
     let bidResp;
     try { bidResp = JSON.parse(bidRespText); }
-    catch {
-      res.status(upstreamResp.status).setHeader("content-type", ct);
-      return res.send(bidRespText);
-    }
+    catch { res.status(upstreamResp.status).setHeader("content-type", ct); return res.send(bidRespText); }
 
-    // 2) Traverse bids and unwrap/merge as needed
+    // 2) Unwrap / Merge
     let anyReplaced = false;
     let anyCacheHit = false;
     let anyMergedWrapperImps = false;
+    let lastDebug = {};
 
     if (Array.isArray(bidResp?.seatbid)) {
       for (const sb of bidResp.seatbid) {
         for (const b of (sb?.bid || [])) {
           if (typeof b.adm !== "string") continue;
 
-          // Case A: normal unwrap (Wrapper → Inline)
+          // Case A: Wrapper → Inline
           if (b.adm.includes("<Wrapper")) {
             try {
               const { adm, replaced, depth, cached } = await unwrapAdmIfWrapper(b.adm);
@@ -155,39 +151,46 @@ export default async function handler(req, res) {
                 anyReplaced = true;
                 if (cached === "hit") anyCacheHit = true;
                 b.ext = { ...(b.ext || {}), unwrap: { depth, cached } };
+                lastDebug = { mode: "unwrap", depth, cached };
               }
             } catch (e) {
-              if (DEBUG) console.warn("[unwrap] failed:", e?.message || e);
               b.ext = { ...(b.ext || {}), unwrap: { depth: -1, cached: "n/a", error: "unwrap-failed" } };
+              lastDebug = { mode: "unwrap", error: e?.message || String(e) };
             }
           }
-          // Case B: Inline-only bid → derive wrapper URL from nurl to merge SSP Impressions
+
+          // Case B: Inline-only → derive RV and merge SSP <Impression>
           else if (b.nurl && b.adm.includes("<InLine")) {
             let rvUrl = null;
             try { rvUrl = deriveEquativRvUrlFromNurl(b.nurl); } catch {}
             if (rvUrl) {
               try {
-                const mergedXml = await mergeWrapperImpressionsIntoInlineXml(b.adm, rvUrl);
-                if (mergedXml && typeof mergedXml === "string") {
+                const mergedXml = await mergeWrapperImpressionsIntoInlineXml(b.adm, rvUrl, { debug });
+                if (mergedXml && typeof mergedXml === "string" && mergedXml !== b.adm) {
                   b.adm = mergedXml;
                   anyMergedWrapperImps = true;
                 }
                 b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: true } };
+                lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: true };
               } catch (e) {
-                if (DEBUG) console.warn("[unwrap:fallback] RV merge failed:", e?.message || e);
-                b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: false, reason: "rv-fetch-failed" } };
+                b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: false, reason: "rv-fetch-or-merge-failed" } };
+                lastDebug = { mode: "merge-wrapper-imps", rvUrl, error: e?.message || String(e) };
               }
             } else {
               b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: false, reason: "rv-url-not-derived" } };
+              lastDebug = { mode: "merge-wrapper-imps", rvUrl: null, reason: "rv-url-not-derived" };
             }
           }
         }
       }
     }
 
-    // 3) Observability headers
+    // 3) Debug headers
     res.setHeader("X-Unwrap", anyReplaced || anyMergedWrapperImps ? "inline" : "passthrough");
     res.setHeader("X-Unwrap-Cache", anyCacheHit ? "hit" : "miss");
+    if (debug && lastDebug) {
+      res.setHeader("X-Unwrap-Debug", JSON.stringify(lastDebug));
+    }
 
     return res.status(upstreamResp.status).json(bidResp);
   } catch (e) {
