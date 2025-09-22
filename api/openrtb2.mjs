@@ -64,10 +64,8 @@ function withTimeout(ms = 8000) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Equativ RV derivation (more tolerant)
-//  - from nurl host:
-//      ssb-use1.smartadserver.com → use1.smartadserver.com
-//      ssb-euw1.smartadserver.com → euw1.smartadserver.com
+// Equativ RV derivation (tolerant)
+//  - ssb-use1.smartadserver.com → use1.smartadserver.com
 //  - vastid = bidid, networkId = bidnwid
 // ─────────────────────────────────────────────────────────────────────────────
 function deriveEquativRvUrlFromNurl(nurl) {
@@ -75,7 +73,6 @@ function deriveEquativRvUrlFromNurl(nurl) {
     const u = new URL(nurl);
     let host = u.host;
     if (host.startsWith("ssb-")) host = host.slice(4);
-    // sometimes host already without ssb-
     const vastid = u.searchParams.get("bidid");
     const networkId = u.searchParams.get("bidnwid");
     if (!vastid || !networkId) return null;
@@ -114,7 +111,7 @@ export default async function handler(req, res) {
       headers: {
         accept: "application/json, text/plain, */*",
         "content-type": "application/json",
-        "user-agent": req.headers["user-agent"] || "VAST-Unwrapper/1.1",
+        "user-agent": req.headers["user-agent"] || "VAST-Unwrapper/1.2",
       },
       body: JSON.stringify(bodyJson),
     });
@@ -135,23 +132,28 @@ export default async function handler(req, res) {
     let anyReplaced = false;
     let anyCacheHit = false;
     let anyMergedWrapperImps = false;
-    let lastDebug = {};
+    let lastDebug = { mode: "passthrough" };
 
     if (Array.isArray(bidResp?.seatbid)) {
       for (const sb of bidResp.seatbid) {
         for (const b of (sb?.bid || [])) {
           if (typeof b.adm !== "string") continue;
 
-          // Case A: Wrapper → Inline
+          // ── STEP A: unwrap if it's a Wrapper
+          let didUnwrap = false;
           if (b.adm.includes("<Wrapper")) {
             try {
               const { adm, replaced, depth, cached } = await unwrapAdmIfWrapper(b.adm);
               if (replaced) {
                 b.adm = adm;
+                didUnwrap = true;
                 anyReplaced = true;
                 if (cached === "hit") anyCacheHit = true;
                 b.ext = { ...(b.ext || {}), unwrap: { depth, cached } };
                 lastDebug = { mode: "unwrap", depth, cached };
+              } else {
+                // even though <Wrapper> existed, nothing changed
+                lastDebug = { mode: "unwrap", depth: 0, cached: "miss" };
               }
             } catch (e) {
               b.ext = { ...(b.ext || {}), unwrap: { depth: -1, cached: "n/a", error: "unwrap-failed" } };
@@ -159,34 +161,53 @@ export default async function handler(req, res) {
             }
           }
 
-          // Case B: Inline-only → derive RV and merge SSP <Impression>
-          else if (b.nurl && b.adm.includes("<InLine")) {
-            let rvUrl = null;
-            try { rvUrl = deriveEquativRvUrlFromNurl(b.nurl); } catch {}
+          // ── STEP B: ALWAYS try RV merge if final adm is Inline and nurl is present
+          //            (covers Inline-only bids AND cases where unwrap depth=0)
+          if (b.nurl && typeof b.adm === "string" && b.adm.includes("<InLine")) {
+            const rvUrl = deriveEquativRvUrlFromNurl(b.nurl);
             if (rvUrl) {
               try {
-                const mergedXml = await mergeWrapperImpressionsIntoInlineXml(b.adm, rvUrl, { debug });
-                if (mergedXml && typeof mergedXml === "string" && mergedXml !== b.adm) {
+                const beforeXml = b.adm;
+                const mergedXml = await mergeWrapperImpressionsIntoInlineXml(beforeXml, rvUrl, { debug });
+                // If merge produced something different, mark it
+                if (mergedXml && typeof mergedXml === "string" && mergedXml !== beforeXml) {
                   b.adm = mergedXml;
                   anyMergedWrapperImps = true;
+                  // Annotate/augment ext.unwrap (don’t overwrite prior info)
+                  b.ext = {
+                    ...(b.ext || {}),
+                    unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: true, rvUrl }
+                  };
+                  lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: true, afterUnwrap: didUnwrap };
+                } else {
+                  b.ext = {
+                    ...(b.ext || {}),
+                    unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, rvUrl, reason: "no-change" }
+                  };
+                  lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: false, reason: "no-change", afterUnwrap: didUnwrap };
                 }
-                b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: true } };
-                lastDebug = { mode: "merge-wrapper-imps", rvUrl, merged: true };
               } catch (e) {
-                b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: false, reason: "rv-fetch-or-merge-failed" } };
-                lastDebug = { mode: "merge-wrapper-imps", rvUrl, error: e?.message || String(e) };
+                b.ext = {
+                  ...(b.ext || {}),
+                  unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, rvUrl, reason: "rv-fetch-or-merge-failed" }
+                };
+                lastDebug = { mode: "merge-wrapper-imps", rvUrl, error: e?.message || String(e), afterUnwrap: didUnwrap };
               }
             } else {
-              b.ext = { ...(b.ext || {}), unwrap: { depth: 0, cached: "n/a", mergedWrapperImps: false, reason: "rv-url-not-derived" } };
-              lastDebug = { mode: "merge-wrapper-imps", rvUrl: null, reason: "rv-url-not-derived" };
+              // couldn’t derive RV URL from nurl
+              b.ext = {
+                ...(b.ext || {}),
+                unwrap: { ...(b.ext?.unwrap || {}), mergedWrapperImps: false, reason: "rv-url-not-derived" }
+              };
+              lastDebug = { mode: "merge-wrapper-imps", rvUrl: null, reason: "rv-url-not-derived", afterUnwrap: didUnwrap };
             }
           }
         }
       }
     }
 
-    // 3) Debug headers
-    res.setHeader("X-Unwrap", anyReplaced || anyMergedWrapperImps ? "inline" : "passthrough");
+    // 3) Debug / observability
+    res.setHeader("X-Unwrap", (anyReplaced || anyMergedWrapperImps) ? "inline" : "passthrough");
     res.setHeader("X-Unwrap-Cache", anyCacheHit ? "hit" : "miss");
     if (debug && lastDebug) {
       res.setHeader("X-Unwrap-Debug", JSON.stringify(lastDebug));
