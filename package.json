@@ -1,9 +1,13 @@
 {
-  "name": "vast-proxy-vercel",
+  "name": "vast-unwrapper",
   "version": "1.0.0",
   "type": "module",
   "private": true,
+  "scripts": {
+    "build": "echo 'no build step'",
+    "start": "vercel dev"
+  },
   "dependencies": {
-    "fast-xml-parser": "^4.4.1"
+    "fast-xml-parser": "^4.4.0"
   }
 }
