@@ -4,9 +4,6 @@
       "runtime": "nodejs20.x",
       "memory": 1024
     }
-  }
-}
-{
-  "buildCommand": "echo \"no build step\"",
-  "outputDirectory": "public"
+  },
+  "buildCommand": "echo \"no build step\""
 }
